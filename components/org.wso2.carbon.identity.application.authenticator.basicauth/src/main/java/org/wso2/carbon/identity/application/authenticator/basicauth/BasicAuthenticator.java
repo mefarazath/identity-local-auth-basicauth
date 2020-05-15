@@ -47,9 +47,10 @@ import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.governance.IdentityGovernanceException;
 import org.wso2.carbon.identity.governance.common.IdentityConnectorConfig;
 import org.wso2.carbon.user.api.UserRealm;
+import org.wso2.carbon.user.core.UniqueIDUserStoreManager;
 import org.wso2.carbon.user.core.UserCoreConstants;
 import org.wso2.carbon.user.core.UserStoreException;
-import org.wso2.carbon.user.core.UserStoreManager;
+import org.wso2.carbon.user.core.common.AuthenticationResult;
 import org.wso2.carbon.user.core.util.UserCoreUtil;
 import org.wso2.carbon.utils.multitenancy.MultitenantUtils;
 
@@ -60,7 +61,11 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
+import java.util.TreeMap;
+import java.util.regex.Pattern;
+
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
@@ -76,6 +81,17 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
     private static final Log log = LogFactory.getLog(BasicAuthenticator.class);
     private static String RE_CAPTCHA_USER_DOMAIN = "user-domain-recaptcha";
     private List<String> omittingErrorParams = null;
+    private static final String MOBILE_CLAIM_URL = "http://wso2.org/claims/mobile";
+    private static final String EMAIL_CLAIM_URL = "http://wso2.org/claims/emailaddress";
+    private static final String USERNAME_CLAIM_URL = "http://wso2.org/claims/username";
+
+    private static Map<String, Pattern> loginAttributeMappings = new TreeMap<>();
+    static {
+        // Set of pre-configured login attributes with regexes that uniquely identify each attribute.
+        loginAttributeMappings.put(EMAIL_CLAIM_URL, Pattern.compile("^(.+)@(.+)$"));
+        loginAttributeMappings.put(MOBILE_CLAIM_URL, Pattern.compile("^[+]*[(]{0,1}[0-9]{1,4}[)]{0,1}[-\\s./0-9]*$"));
+        loginAttributeMappings.put(USERNAME_CLAIM_URL, Pattern.compile("[a-zA-Z0-9._\\-|//]{3,30}$"));
+    }
 
     @Override
     public boolean canHandle(HttpServletRequest request) {
@@ -359,7 +375,7 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
         authProperties.put(PASSWORD_PROPERTY, password);
 
         boolean isAuthenticated;
-        UserStoreManager userStoreManager;
+        UniqueIDUserStoreManager userStoreManager;
         // Reset RE_CAPTCHA_USER_DOMAIN thread local variable before the authentication
         IdentityUtil.threadLocalProperties.get().remove(RE_CAPTCHA_USER_DOMAIN);
         // Check the authentication
@@ -367,9 +383,25 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
             int tenantId = IdentityTenantUtil.getTenantIdOfUser(username);
             UserRealm userRealm = BasicAuthenticatorServiceComponent.getRealmService().getTenantUserRealm(tenantId);
             if (userRealm != null) {
-                userStoreManager = (UserStoreManager) userRealm.getUserStoreManager();
-                isAuthenticated = userStoreManager.authenticate(
-                        MultitenantUtils.getTenantAwareUsername(username), password);
+
+                userStoreManager = (UniqueIDUserStoreManager) userRealm.getUserStoreManager();
+
+                String loginIdentifier = MultitenantUtils.getTenantAwareUsername(username);
+                String loginAttribute = detectLoginAttribute(loginIdentifier);
+                if (loginAttribute == null) {
+                    // This means we were not detect the login attribute from the login identifier. We can either
+                    // default to username or fail. For this PoC we fail.
+                    throw new AuthenticationFailedException("Cannot find a valid login attribute for identifier: " + username);
+                }
+
+                // Authenticate with the detected login attribute.
+                AuthenticationResult result = userStoreManager.authenticateWithID(loginAttribute, loginIdentifier, password, null);
+                isAuthenticated = result.getAuthenticationStatus() == AuthenticationResult.AuthenticationStatus.SUCCESS;
+                Optional<org.wso2.carbon.user.core.common.User> authenticatedUser = result.getAuthenticatedUser();
+                if (authenticatedUser.isPresent() && authenticatedUser.get().getUsername() != null) {
+                    username = FrameworkUtils.preprocessUsername(authenticatedUser.get().getUsername(), context);
+                }
+
             } else {
                 throw new AuthenticationFailedException("Cannot find the user realm for the given tenant: " +
                         tenantId, User.getUserFromUserName(username));
@@ -386,6 +418,7 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
             throw new AuthenticationFailedException(e.getMessage(), e);
         }
 
+        // TODO: handle scenario where username is not used as an identifier but authentication fails.
         if (!isAuthenticated) {
             if (log.isDebugEnabled()) {
                 log.debug("User authentication failed due to invalid credentials");
@@ -455,6 +488,17 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
         if ("on".equals(rememberMe)) {
             context.setRememberMe(true);
         }
+    }
+
+    private static String detectLoginAttribute(String loginIdentifier) {
+
+        for (Map.Entry<String, Pattern> stringPatternEntry : loginAttributeMappings.entrySet()) {
+            Pattern pattern = stringPatternEntry.getValue();
+            if (pattern.matcher(loginIdentifier).matches()) {
+                return stringPatternEntry.getKey();
+            }
+        }
+        return null;
     }
 
     @Override
