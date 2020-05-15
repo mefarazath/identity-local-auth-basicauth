@@ -47,9 +47,11 @@ import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.governance.IdentityGovernanceException;
 import org.wso2.carbon.identity.governance.common.IdentityConnectorConfig;
 import org.wso2.carbon.user.api.UserRealm;
+import org.wso2.carbon.user.core.UniqueIDUserStoreManager;
 import org.wso2.carbon.user.core.UserCoreConstants;
 import org.wso2.carbon.user.core.UserStoreException;
 import org.wso2.carbon.user.core.UserStoreManager;
+import org.wso2.carbon.user.core.common.AuthenticationResult;
 import org.wso2.carbon.user.core.util.UserCoreUtil;
 import org.wso2.carbon.utils.multitenancy.MultitenantUtils;
 
@@ -76,6 +78,8 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
     private static final Log log = LogFactory.getLog(BasicAuthenticator.class);
     private static String RE_CAPTCHA_USER_DOMAIN = "user-domain-recaptcha";
     private List<String> omittingErrorParams = null;
+    private static final String MOBILE_CLAIM_URL = "http://wso2.org/claims/mobile";
+    private static final String USERNAME_CLAIM_URL = "http://wso2.org/claims/username";
 
     @Override
     public boolean canHandle(HttpServletRequest request) {
@@ -359,7 +363,7 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
         authProperties.put(PASSWORD_PROPERTY, password);
 
         boolean isAuthenticated;
-        UserStoreManager userStoreManager;
+        UniqueIDUserStoreManager userStoreManager;
         // Reset RE_CAPTCHA_USER_DOMAIN thread local variable before the authentication
         IdentityUtil.threadLocalProperties.get().remove(RE_CAPTCHA_USER_DOMAIN);
         // Check the authentication
@@ -367,9 +371,35 @@ public class BasicAuthenticator extends AbstractApplicationAuthenticator
             int tenantId = IdentityTenantUtil.getTenantIdOfUser(username);
             UserRealm userRealm = BasicAuthenticatorServiceComponent.getRealmService().getTenantUserRealm(tenantId);
             if (userRealm != null) {
-                userStoreManager = (UserStoreManager) userRealm.getUserStoreManager();
-                isAuthenticated = userStoreManager.authenticate(
-                        MultitenantUtils.getTenantAwareUsername(username), password);
+
+                userStoreManager = (UniqueIDUserStoreManager) userRealm.getUserStoreManager();
+
+                // Set of pre-configured login attributes
+                List<String> loginAttributes = new ArrayList<>();
+                loginAttributes.add(USERNAME_CLAIM_URL);
+                loginAttributes.add(MOBILE_CLAIM_URL);
+
+                // First do a user lookup based on configured login attributes.
+                org.wso2.carbon.user.core.common.User user = null;
+                String loginIdentifier = MultitenantUtils.getTenantAwareUsername(username);
+                for (String loginAttribute : loginAttributes) {
+                    List<org.wso2.carbon.user.core.common.User> userList =
+                            userStoreManager.getUserListWithID(loginAttribute, loginIdentifier, null);
+                    if (!userList.isEmpty()) {
+                        user = userList.get(0);
+                        break;
+                    }
+                }
+
+                if (user == null) {
+                    // This means we were not able to find a user from the given login attributes.
+                    throw new AuthenticationFailedException("Cannot find the user with identifier: " + username);
+                }
+
+                // Set the username from the lookup result.
+                username = user.getUsername();
+                AuthenticationResult result = userStoreManager.authenticateWithID(user.getUserID(), password);
+                isAuthenticated = result.getAuthenticationStatus() == AuthenticationResult.AuthenticationStatus.SUCCESS;
             } else {
                 throw new AuthenticationFailedException("Cannot find the user realm for the given tenant: " +
                         tenantId, User.getUserFromUserName(username));
